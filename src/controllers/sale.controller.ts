@@ -55,6 +55,26 @@ const getRangeTotal = async (match: Record<string, unknown>) => {
   return summary[0]?.total ?? 0;
 };
 
+const getRangeSummary = async (match: Record<string, unknown>) => {
+  const summary = await SaleModel.aggregate<{ dueTotal: number; paidTotal: number; total: number }>([
+    { $match: match },
+    {
+      $group: {
+        _id: null,
+        dueTotal: { $sum: "$dueAmount" },
+        paidTotal: { $sum: "$paidAmount" },
+        total: { $sum: "$grandTotal" },
+      },
+    },
+  ]);
+
+  return {
+    dueTotal: summary[0]?.dueTotal ?? 0,
+    paidTotal: summary[0]?.paidTotal ?? 0,
+    total: summary[0]?.total ?? 0,
+  };
+};
+
 const normalizeSaleItems = (items: unknown[]): SaleItemInput[] => {
   return items.map((item) => {
     const raw = (item ?? {}) as RawSaleItem;
@@ -77,11 +97,25 @@ const validateSalePayload = (body: Record<string, unknown>) => {
     errors.push("customerId is required and must be a valid id.");
   }
 
+  const rawExtraDiscount = body.extraDiscount;
+  const extraDiscount = rawExtraDiscount === undefined ? 0 : toNumber(rawExtraDiscount);
+
+  if (!Number.isFinite(extraDiscount) || extraDiscount < 0) {
+    errors.push("extraDiscount must be 0 or greater.");
+  }
+
+  const rawPaidAmount = body.paidAmount;
+  const paidAmount = rawPaidAmount === undefined ? undefined : toNumber(rawPaidAmount);
+
+  if (paidAmount !== undefined && (!Number.isFinite(paidAmount) || paidAmount < 0)) {
+    errors.push("paidAmount must be 0 or greater.");
+  }
+
   const rawItems = body.items;
 
   if (!Array.isArray(rawItems) || rawItems.length === 0) {
     errors.push("items must be a non-empty array.");
-    return { customerId, errors, items: [] as SaleItemInput[] };
+    return { customerId, errors, extraDiscount, items: [] as SaleItemInput[], paidAmount };
   }
 
   const items = normalizeSaleItems(rawItems);
@@ -106,10 +140,10 @@ const validateSalePayload = (body: Record<string, unknown>) => {
     }
   });
 
-  return { customerId, errors, items };
+  return { customerId, errors, extraDiscount, items, paidAmount };
 };
 
-const buildSaleDocument = async (customerId: string, items: SaleItemInput[]) => {
+const buildSaleDocument = async (customerId: string, items: SaleItemInput[], extraDiscount: number, paidAmount?: number) => {
   const customer = await CustomerModel.findById(customerId);
 
   if (!customer) {
@@ -152,15 +186,21 @@ const buildSaleDocument = async (customerId: string, items: SaleItemInput[]) => 
   });
 
   const subtotal = hydratedItems.reduce((sum, item) => sum + item.quantity * item.unitPrice, 0);
-  const grandTotal = hydratedItems.reduce((sum, item) => sum + item.lineTotal, 0);
+  const rowsGrandTotal = hydratedItems.reduce((sum, item) => sum + item.lineTotal, 0);
+  const grandTotal = Math.max(0, rowsGrandTotal - extraDiscount);
   const totalDiscount = Math.max(0, subtotal - grandTotal);
+  const resolvedPaidAmount = paidAmount !== undefined ? Math.min(paidAmount, grandTotal) : grandTotal;
+  const dueAmount = Math.max(0, grandTotal - resolvedPaidAmount);
 
   return {
     sale: {
       customer: customer._id,
       customerName: customer.name,
+      dueAmount,
+      extraDiscount,
       grandTotal,
       items: hydratedItems,
+      paidAmount: resolvedPaidAmount,
       subtotal,
       totalDiscount,
     },
@@ -179,7 +219,7 @@ export const createSale = async (req: Request, res: Response) => {
     return;
   }
 
-  const saleDocument = await buildSaleDocument(validation.customerId, validation.items);
+  const saleDocument = await buildSaleDocument(validation.customerId, validation.items, validation.extraDiscount, validation.paidAmount);
 
   if ("error" in saleDocument) {
     res.status(400).json({
@@ -339,7 +379,7 @@ export const getSaleStats = async (req: Request, res: Response) => {
   const rawStartDate = getSingleQueryValue(req.query.startDate);
   const rawEndDate = getSingleQueryValue(req.query.endDate);
 
-  let range: { endDate: string; startDate: string; total: number } | null = null;
+  let range: { dueTotal: number; endDate: string; paidTotal: number; startDate: string; total: number } | null = null;
 
   if (rawStartDate !== undefined || rawEndDate !== undefined) {
     if (typeof rawStartDate !== "string" || typeof rawEndDate !== "string") {
@@ -379,7 +419,7 @@ export const getSaleStats = async (req: Request, res: Response) => {
       return;
     }
 
-    const rangeTotal = await getRangeTotal({
+    const rangeSummary = await getRangeSummary({
       createdAt: {
         $gte: startDate,
         $lt: endBoundary,
@@ -387,21 +427,23 @@ export const getSaleStats = async (req: Request, res: Response) => {
     });
 
     range = {
+      dueTotal: rangeSummary.dueTotal,
       endDate: endDateText,
+      paidTotal: rangeSummary.paidTotal,
       startDate: startDateText,
-      total: rangeTotal,
+      total: rangeSummary.total,
     };
   }
 
-  const [lifetimeTotal, yearlyTotal, monthlyTotal] = await Promise.all([
-    getRangeTotal({}),
+  const [lifetimeSummary, yearlyTotal, monthlySummary] = await Promise.all([
+    getRangeSummary({}),
     getRangeTotal({
       createdAt: {
         $gte: yearStart,
         $lt: yearEnd,
       },
     }),
-    getRangeTotal({
+    getRangeSummary({
       createdAt: {
         $gte: monthStart,
       },
@@ -410,8 +452,12 @@ export const getSaleStats = async (req: Request, res: Response) => {
 
   res.status(200).json({
     data: {
-      lifetimeTotal,
-      monthlyTotal,
+      lifetimeDueTotal: lifetimeSummary.dueTotal,
+      lifetimePaidTotal: lifetimeSummary.paidTotal,
+      lifetimeTotal: lifetimeSummary.total,
+      monthlyDueTotal: monthlySummary.dueTotal,
+      monthlyPaidTotal: monthlySummary.paidTotal,
+      monthlyTotal: monthlySummary.total,
       range,
       selectedYear,
       yearlyTotal,
@@ -466,7 +512,7 @@ export const updateSale = async (req: Request, res: Response) => {
     return;
   }
 
-  const saleDocument = await buildSaleDocument(validation.customerId, validation.items);
+  const saleDocument = await buildSaleDocument(validation.customerId, validation.items, validation.extraDiscount, validation.paidAmount);
 
   if ("error" in saleDocument) {
     res.status(400).json({

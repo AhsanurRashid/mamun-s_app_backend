@@ -12,9 +12,12 @@ export interface SaleItem {
 export interface Sale {
   customer: Types.ObjectId;
   customerName: string;
+  dueAmount: number;
+  extraDiscount: number;
   grandTotal: number;
   items: SaleItem[];
   note?: string;
+  paidAmount: number;
   subtotal: number;
   totalDiscount: number;
 }
@@ -84,6 +87,24 @@ const saleSchema = new Schema<Sale>(
         message: "At least one sale item is required.",
         validator: (value: SaleItem[]) => Array.isArray(value) && value.length > 0,
       },
+    },
+    dueAmount: {
+      default: 0,
+      min: 0,
+      required: true,
+      type: Number,
+    },
+    extraDiscount: {
+      default: 0,
+      min: 0,
+      required: true,
+      type: Number,
+    },
+    paidAmount: {
+      default: 0,
+      min: 0,
+      required: true,
+      type: Number,
     },
     note: {
       trim: true,
